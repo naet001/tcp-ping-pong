@@ -8,13 +8,15 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
 
 const (
-	maxConnections = 100
-	readTimeout    = 30 * time.Second
+	maxConnections      = 100
+	readTimeout         = 30 * time.Second
+	shutdownGracePeriod = 5 * time.Second
 )
 
 func main() {
@@ -22,45 +24,87 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer listener.Close()
 
-	log.Println("Server listening on port 9000")
-
-	// Semaphore for connection limiting
-	sem := make(chan struct{}, maxConnections)
-
-	// Context for graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	log.Println("Server listening on port 9000")
+	serve(ctx, listener, shutdownGracePeriod)
+}
+
+func serve(ctx context.Context, listener net.Listener, gracePeriod time.Duration) {
+	connections := make(map[net.Conn]struct{})
+	var connectionsMu sync.Mutex
+	var handlers sync.WaitGroup
+	sem := make(chan struct{}, maxConnections)
+
+	stopClosingListener := context.AfterFunc(ctx, func() {
+		listener.Close()
+	})
+	defer stopClosingListener()
+
+acceptLoop:
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			select {
-			case <-ctx.Done():
-				log.Println("Shutting down...")
-				return
-			default:
-				log.Println("Accept error:", err)
+			if ctx.Err() != nil {
+				break
 			}
+			log.Println("Accept error:", err)
 			continue
 		}
 
-		// Block if at capacity
 		select {
-		case sem <- struct{}{}:
-			go func() {
-				defer func() { <-sem }()
-				handleConnection(ctx, conn)
-			}()
 		case <-ctx.Done():
 			conn.Close()
-			log.Println("Rejecting connection: shutting down")
+			break acceptLoop
+		default:
+		}
+
+		select {
+		case sem <- struct{}{}:
+			connectionsMu.Lock()
+			connections[conn] = struct{}{}
+			connectionsMu.Unlock()
+
+			handlers.Add(1)
+			go func() {
+				defer handlers.Done()
+				defer func() { <-sem }()
+				defer func() {
+					connectionsMu.Lock()
+					delete(connections, conn)
+					connectionsMu.Unlock()
+				}()
+				handleConnection(ctx, conn)
+			}()
 		default:
 			conn.Close()
 			log.Println("Rejecting connection: server at capacity")
 		}
 	}
+
+	drained := make(chan struct{})
+	go func() {
+		handlers.Wait()
+		close(drained)
+	}()
+
+	timer := time.NewTimer(gracePeriod)
+	defer timer.Stop()
+
+	select {
+	case <-drained:
+		return
+	case <-timer.C:
+	}
+
+	connectionsMu.Lock()
+	for conn := range connections {
+		conn.Close()
+	}
+	connectionsMu.Unlock()
+	<-drained
 }
 
 func handleConnection(ctx context.Context, conn net.Conn) {
@@ -72,7 +116,6 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 	scanner := bufio.NewScanner(conn)
 
 	for {
-		// Set read deadline for each iteration
 		conn.SetReadDeadline(time.Now().Add(readTimeout))
 
 		if !scanner.Scan() {
@@ -91,7 +134,6 @@ func handleConnection(ctx context.Context, conn net.Conn) {
 			fmt.Fprintln(conn, "ERROR: expected PING")
 		}
 
-		// Check if shutdown was requested
 		select {
 		case <-ctx.Done():
 			log.Printf("Connection %v: shutdown requested", conn.RemoteAddr())
