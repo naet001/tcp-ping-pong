@@ -5,21 +5,37 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"time"
 )
 
+const requestTimeout = 5 * time.Second
+
 func main() {
-	conn, err := net.Dial("tcp", "localhost:9000")
+	response, err := ping("localhost:9000", requestTimeout)
 	if err != nil {
 		log.Fatal(err)
+	}
+	fmt.Println("Server:", response)
+}
+
+func ping(address string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	conn, err := (&net.Dialer{Deadline: deadline}).Dial("tcp", address)
+	if err != nil {
+		return "", err
 	}
 	defer conn.Close()
 
-	fmt.Fprintln(conn, "PING")
+	if err := conn.SetDeadline(deadline); err != nil {
+		return "", err
+	}
+	if _, err := fmt.Fprintln(conn, "PING"); err != nil {
+		return "", err
+	}
 
 	response, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
-		log.Fatal(err)
+		return "", err
 	}
-
-	fmt.Println("Server:", response)
+	return response, nil
 }
